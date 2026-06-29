@@ -103,11 +103,11 @@ After each run, check the **Cart failure breakdown** in the k6 summary (`shop_fa
 
 ## Deploy
 
-Edit locally, sync, and deploy:
+Edit locally, sync, and deploy from WSL:
 
-```powershell
-cd C:\Users\flyluk\Projects\shop-demo\scripts
-.\deploy-remote.ps1
+```bash
+cd /mnt/c/Users/flyluk/Projects/shop-demo/scripts
+./deploy-remote.sh
 ```
 
 Or on dev-vm1:
@@ -134,11 +134,11 @@ curl -s http://<web-lb-ip>/health
 curl -s http://<web-lb-ip>/api/products | head -c 200
 ```
 
-From Windows (replace IP):
+From WSL (replace IP):
 
-```powershell
-Invoke-RestMethod http://192.168.1.53/health
-(Invoke-RestMethod http://192.168.1.53/api/products) | Select id, name, stock
+```bash
+curl -s http://192.168.1.53/health
+curl -s http://192.168.1.53/api/products | head -c 200
 ```
 
 ---
@@ -162,11 +162,13 @@ bash /home/flyluk/development/shop-demo/scripts/reset-shop-demo-db.sh  # between
 
 ## Run k6
 
-```powershell
-cd C:\Users\flyluk\Projects\shopperf\k6
+From WSL:
+
+```bash
+cd /mnt/c/Users/flyluk/Projects/shopperf/k6
 
 # Optional: reset stock on cluster first (ssh to dev-vm1)
-.\run.ps1 -TestId "20260629-1"
+./run.sh --test-id 20260629-1
 ```
 
 Read the human summary at the end of the run:
@@ -221,8 +223,10 @@ Do **not** raise per-worker pools without raising Postgres `max_connections` or 
 | `shop-demo/scripts/shop-demo-postgres-values.yaml` | Postgres Helm values |
 | `shop-demo/scripts/init-shop-demo-db.sh` | Schema + seed |
 | `shop-demo/scripts/reset-shop-demo-db.sh` | Reset between k6 runs |
-| `shop-demo/scripts/deploy-remote.ps1` | Sync + deploy from Windows |
+| `shop-demo/scripts/deploy-remote.sh` | Sync + deploy from WSL |
 | `shop-demo/db/init.sql` | SQL source for init script |
+| `shopperf/k6/run.sh` | Run k6 from WSL (primary) |
 | `shopperf/k6/shopperf.js` | k6 scenario, failure metrics, retries |
 | `shopperf/k6/.env` | Load profile + thresholds |
+| `shopperf/scripts/expose-prometheus.sh` | Expose Prometheus remote write |
 | `shopperf/scripts/tune-shop-demo-remote.sh` | Legacy one-shot remote patch script |

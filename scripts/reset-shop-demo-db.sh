@@ -9,7 +9,7 @@ PW="$(kubectl get secret shop-demo-secrets -n "$NS" -o jsonpath='{.data.POSTGRES
 
 kubectl exec -n "$NS" "$PG_POD" -- env PGPASSWORD="$PW" psql -U shopuser -d shopdb -v ON_ERROR_STOP=1 <<'SQL'
 DELETE FROM cart_items;
-UPDATE products SET stock = 200;
+UPDATE products SET stock = 20000;
 SQL
 
-echo "Cleared cart_items and set all product stock to 200."
+echo "Cleared cart_items and set all product stock to 20000."
