@@ -1,0 +1,18 @@
+services:
+  k6:
+    image: grafana/k6:latest
+    volumes:
+      - .:/scripts:ro
+    environment:
+      BASE_URL: ${BASE_URL}
+      TEST_EMAIL_PREFIX_BASE: ${TEST_EMAIL_PREFIX_BASE:-k6user}
+      TEST_RUN_ID: ${TEST_RUN_ID:-}
+      TEST_PASSWORD: ${TEST_PASSWORD}
+      K6_PROMETHEUS_RW_SERVER_URL: ${PROMETHEUS_RW_URL}
+    command:
+      - run
+      - --out
+      - experimental-prometheus-rw
+      - /scripts/shopperf.js
+    profiles:
+      - run

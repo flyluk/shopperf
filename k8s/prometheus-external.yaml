@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-remote-write
+  namespace: monitoring
+  labels:
+    app: prometheus-remote-write
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: prometheus
+    operator.prometheus.io/name: kube-prometheus-kube-prome-prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
