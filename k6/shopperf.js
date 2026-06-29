@@ -23,6 +23,9 @@ const K6_HTTP_TIMEOUT = __ENV.K6_HTTP_TIMEOUT || '10s';
 const K6_CART_MODE = (__ENV.K6_CART_MODE || 'add_remove').toLowerCase();
 const K6_NO_CONNECTION_REUSE = __ENV.K6_NO_CONNECTION_REUSE === 'true' || __ENV.K6_NO_CONNECTION_REUSE === '1';
 const K6_CART_RETRIES = Number(__ENV.K6_CART_RETRIES || 1);
+const K6_SETUP_BATCH_SIZE = Number(__ENV.K6_SETUP_BATCH_SIZE || 25);
+// Default scales with VU count (~2 HTTP calls/user sequential); batching makes this a safety margin.
+const K6_SETUP_TIMEOUT = __ENV.K6_SETUP_TIMEOUT || `${Math.max(60, Math.ceil(K6_VUS * 0.75))}s`;
 
 const checkoutErrors = new Counter('shop_checkout_errors');
 const cartFailures = new Counter('shop_cart_failures');
@@ -190,6 +193,7 @@ export const options = {
   },
   thresholds,
   noConnectionReuse: K6_NO_CONNECTION_REUSE,
+  setupTimeout: K6_SETUP_TIMEOUT,
 };
 
 function jsonHeaders(token) {
@@ -233,30 +237,56 @@ function parseProducts(response) {
   return Array.isArray(body) ? body : (body.products || []);
 }
 
-function registerNewUser(vu) {
-  const email = vuEmail(vu);
+function registerAllUsers() {
+  const tokens = {};
+  const batchSize = Math.max(1, K6_SETUP_BATCH_SIZE);
 
-  const registerRes = http.post(
-    `${BASE_URL}/api/auth/register`,
-    JSON.stringify({ email, password: TEST_PASSWORD }),
-    { ...jsonHeaders(), tags: { name: 'auth_register' } }
-  );
+  for (let start = 1; start <= K6_VUS; start += batchSize) {
+    const end = Math.min(start + batchSize - 1, K6_VUS);
+    const registerBatch = {};
 
-  if (registerRes.status !== 201 && registerRes.status !== 409) {
-    return null;
+    for (let vu = start; vu <= end; vu += 1) {
+      registerBatch[`reg_${vu}`] = {
+        method: 'POST',
+        url: `${BASE_URL}/api/auth/register`,
+        body: JSON.stringify({ email: vuEmail(vu), password: TEST_PASSWORD }),
+        params: { ...jsonHeaders(), tags: { name: 'auth_register' } },
+      };
+    }
+
+    const registerResults = http.batch(registerBatch);
+    const loginBatch = {};
+
+    for (let vu = start; vu <= end; vu += 1) {
+      const registerRes = registerResults[`reg_${vu}`];
+      if (registerRes.status !== 201 && registerRes.status !== 409) {
+        throw new Error(
+          `Failed to register user for VU ${vu}: ${vuEmail(vu)} status=${registerRes.status} ` +
+            `${registerRes.error || registerRes.body || ''}`
+        );
+      }
+      loginBatch[`login_${vu}`] = {
+        method: 'POST',
+        url: `${BASE_URL}/api/auth/login`,
+        body: JSON.stringify({ email: vuEmail(vu), password: TEST_PASSWORD }),
+        params: { ...jsonHeaders(), tags: { name: 'auth_login' } },
+      };
+    }
+
+    const loginResults = http.batch(loginBatch);
+    for (let vu = start; vu <= end; vu += 1) {
+      const loginRes = loginResults[`login_${vu}`];
+      if (loginRes.status !== 200) {
+        throw new Error(
+          `Failed to login user for VU ${vu}: ${vuEmail(vu)} status=${loginRes.status} ` +
+            `${loginRes.error || loginRes.body || ''}`
+        );
+      }
+      tokens[String(vu)] = loginRes.json('access_token');
+    }
   }
 
-  const loginRes = http.post(
-    `${BASE_URL}/api/auth/login`,
-    JSON.stringify({ email, password: TEST_PASSWORD }),
-    { ...jsonHeaders(), tags: { name: 'auth_login' } }
-  );
-
-  if (loginRes.status !== 200) {
-    return null;
-  }
-
-  return loginRes.json('access_token');
+  return tokens;
 }
 
 function removeCartItem(token, cartItemId) {
@@ -365,16 +395,7 @@ export function setup() {
     throw new Error('No products returned from API');
   }
 
-  const tokens = {};
-  for (let vu = 1; vu <= K6_VUS; vu += 1) {
-    const token = registerNewUser(vu);
-    if (!token) {
-      throw new Error(
-        `Failed to register/login user for VU ${vu}: ${vuEmail(vu)} (check API is reachable and password meets min length)`
-      );
-    }
-    tokens[String(vu)] = token;
-  }
+  const tokens = registerAllUsers();
 
   return { tokens, products, testid: TEST_RUN_ID, startedAt: new Date().toISOString() };
 }
@@ -488,6 +509,7 @@ function formatHumanSummary(data) {
   return [
     `=== k6 summary (testid=${TEST_RUN_ID}) ===`,
     `VUs: ${vus ?? 'n/a'} | iterations: ${iterations ?? 'n/a'} | cart mode: ${K6_CART_MODE}`,
+    `Setup: batch=${K6_SETUP_BATCH_SIZE} timeout=${K6_SETUP_TIMEOUT}`,
     `Product stock at setup: ${stockSummary}`,
     '',
     'Per-iteration (successful only, shop_iteration_ms):',
