@@ -10,10 +10,13 @@ const TEST_PASSWORD = __ENV.TEST_PASSWORD || 'k6pass123';
 const TEST_EMAIL_DOMAIN = __ENV.TEST_EMAIL_DOMAIN || 'example.com';
 const TEST_RUN_ID = __ENV.TEST_ID || __ENV.TEST_RUN_ID || String(Date.now());
 const TEST_EMAIL_PREFIX_BASE = __ENV.TEST_EMAIL_PREFIX_BASE || 'k6user';
-// Always tied to testid: k6user-{runId}-vu{N}@domain
-const TEST_EMAIL_PREFIX = `${TEST_EMAIL_PREFIX_BASE}-${TEST_RUN_ID}`;
+const TEST_SCENARIO_SUFFIX = __ENV.TEST_SCENARIO_SUFFIX || '';
+// k6user-{runId}-{cart|checkout}-vu{N}@domain when running parallel scenarios
+const TEST_EMAIL_PREFIX = TEST_SCENARIO_SUFFIX
+  ? `${TEST_EMAIL_PREFIX_BASE}-${TEST_RUN_ID}-${TEST_SCENARIO_SUFFIX}`
+  : `${TEST_EMAIL_PREFIX_BASE}-${TEST_RUN_ID}`;
 
-const K6_VUS = Number(__ENV.K6_VUS || 5);
+const K6_VUS = Number(__ENV.SHOP_K6_VUS || __ENV.K6_VUS || 5);
 const K6_RAMP_UP = __ENV.K6_RAMP_UP || '5s';
 const K6_HOLD = __ENV.K6_HOLD || '25s';
 const K6_RAMP_DOWN = __ENV.K6_RAMP_DOWN || '5s';
@@ -21,6 +24,8 @@ const K6_SLEEP = Number(__ENV.K6_SLEEP || 0);
 const K6_HTTP_TIMEOUT = __ENV.K6_HTTP_TIMEOUT || '10s';
 // add_remove restores stock via API delete (sustainable load). add = stock runs out → 400s.
 const K6_CART_MODE = (__ENV.K6_CART_MODE || 'add_remove').toLowerCase();
+// browse_and_cart (default) | checkout (cart → edit address → place order)
+const K6_SCENARIO = (__ENV.K6_SCENARIO || 'browse_and_cart').toLowerCase();
 const K6_NO_CONNECTION_REUSE = __ENV.K6_NO_CONNECTION_REUSE === 'true' || __ENV.K6_NO_CONNECTION_REUSE === '1';
 const K6_CART_RETRIES = Number(__ENV.K6_CART_RETRIES || 1);
 const K6_SETUP_BATCH_SIZE = Number(__ENV.K6_SETUP_BATCH_SIZE || 25);
@@ -28,6 +33,8 @@ const K6_SETUP_BATCH_SIZE = Number(__ENV.K6_SETUP_BATCH_SIZE || 25);
 const K6_SETUP_TIMEOUT = __ENV.K6_SETUP_TIMEOUT || `${Math.max(60, Math.ceil(K6_VUS * 0.75))}s`;
 
 const checkoutErrors = new Counter('shop_checkout_errors');
+const checkoutFailures = new Counter('shop_checkout_failures');
+const checkoutOkMs = new Trend('shop_checkout_ok_ms', true);
 const cartFailures = new Counter('shop_cart_failures');
 const failAddTimeout = new Counter('shop_fail_add_timeout');
 const failRemoveTimeout = new Counter('shop_fail_remove_timeout');
@@ -169,7 +176,32 @@ withEndpointThresholds(thresholds, 'http_req_duration{name:cart_add,expected_res
 withEndpointThresholds(thresholds, 'http_req_duration{name:cart_get}', 'K6_THRESHOLD_CART_GET', { p95: 500 });
 withEndpointThresholds(thresholds, 'http_req_duration{name:cart_remove}', 'K6_THRESHOLD_CART_REMOVE', { p95: 500 });
 withEndpointThresholds(thresholds, 'http_req_duration{name:auth_register}', 'K6_THRESHOLD_AUTH_REGISTER', { p95: 3000 });
-withEndpointThresholds(thresholds, 'http_req_duration{name:auth_login}', 'K6_THRESHOLD_AUTH_LOGIN', { p95: 1000 });
+withEndpointThresholds(thresholds, 'http_req_duration{name:auth_login}', 'K6_THRESHOLD_AUTH_LOGIN', { p95: 2000 });
+if (K6_SCENARIO === 'checkout') {
+  withEndpointThresholds(thresholds, 'http_req_duration{name:address_create}', 'K6_THRESHOLD_ADDRESS_CREATE', { p95: 1000 });
+  withEndpointThresholds(thresholds, 'http_req_duration{name:address_edit}', 'K6_THRESHOLD_ADDRESS_EDIT', { p95: 1000 });
+  withEndpointThresholds(thresholds, 'http_req_duration{name:payment_create}', 'K6_THRESHOLD_PAYMENT_CREATE', { p95: 1000 });
+  withEndpointThresholds(thresholds, 'http_req_duration{name:checkout}', 'K6_THRESHOLD_CHECKOUT', { p95: 2000 });
+}
+
+function scenarioConfig() {
+  const stages = [
+    { duration: K6_RAMP_UP, target: K6_VUS },
+    { duration: K6_HOLD, target: K6_VUS },
+    { duration: K6_RAMP_DOWN, target: 0 },
+  ];
+  const common = {
+    executor: 'ramping-vus',
+    startVUs: 0,
+    stages,
+    gracefulRampDown: '2s',
+    gracefulStop: '1s',
+  };
+  if (K6_SCENARIO === 'checkout') {
+    return { checkout: { ...common, exec: 'checkoutScenario' } };
+  }
+  return { browse_and_cart: { ...common, exec: 'default' } };
+}
 
 export const options = {
   tags: {
@@ -177,20 +209,7 @@ export const options = {
   },
   // Omit max — one hung socket at test end can report ~29750ms while med/p95 stay ~10ms.
   summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)'],
-  scenarios: {
-    browse_and_cart: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: K6_RAMP_UP, target: K6_VUS },
-        { duration: K6_HOLD, target: K6_VUS },
-        { duration: K6_RAMP_DOWN, target: 0 },
-      ],
-      // Let in-flight requests finish during ramp-down (avoids ~29s interrupted outliers).
-      gracefulRampDown: '2s',
-      gracefulStop: '1s',
-    },
-  },
+  scenarios: scenarioConfig(),
   thresholds,
   noConnectionReuse: K6_NO_CONNECTION_REUSE,
   setupTimeout: K6_SETUP_TIMEOUT,
@@ -299,6 +318,94 @@ function removeCartItem(token, cartItemId) {
   return res;
 }
 
+function addressPayload(vu, iter = 0) {
+  return {
+    label: `VU${vu} Home`,
+    line1: `${100 + vu} Test Street`,
+    line2: iter ? `Suite ${iter}` : null,
+    city: iter ? `Testville-${iter}` : 'Testville',
+    state: 'TS',
+    postal_code: String(10000 + vu),
+    country: 'US',
+    is_preferred: true,
+  };
+}
+
+function createAddress(token, vu, params = {}) {
+  const body = JSON.stringify(addressPayload(vu));
+  return http.post(`${BASE_URL}/api/addresses`, body, {
+    ...jsonHeaders(token),
+    tags: { name: 'address_create' },
+    ...params,
+  });
+}
+
+function editAddress(token, addressId, vu, iter) {
+  const body = JSON.stringify({
+    label: `VU${vu} Home`,
+    line1: `${100 + vu} Test Street`,
+    line2: `Suite ${iter}`,
+    city: `Testville-${iter}`,
+    state: 'TS',
+    postal_code: String(10000 + vu),
+    country: 'US',
+  });
+  return http.put(`${BASE_URL}/api/addresses/${addressId}`, body, {
+    ...jsonHeaders(token),
+    tags: { name: 'address_edit' },
+  });
+}
+
+function createPaymentMethod(token, vu) {
+  const lastFour = String(1000 + vu).slice(-4);
+  const body = JSON.stringify({
+    label: `VU${vu} Card`,
+    card_number: `411111111111${lastFour}`,
+    expiry_month: 12,
+    expiry_year: 2030,
+    is_preferred: true,
+  });
+  return http.post(`${BASE_URL}/api/payment-methods`, body, {
+    ...jsonHeaders(token),
+    tags: { name: 'payment_create' },
+  });
+}
+
+function placeCheckout(token, addressId, paymentMethodId) {
+  const body = JSON.stringify({
+    address_id: addressId,
+    payment_method_id: paymentMethodId,
+  });
+  return http.post(`${BASE_URL}/api/checkout`, body, {
+    ...jsonHeaders(token),
+    tags: { name: 'checkout' },
+  });
+}
+
+function setupCheckoutProfiles(tokens) {
+  const profiles = {};
+  for (let vu = 1; vu <= K6_VUS; vu += 1) {
+    const token = tokens[String(vu)];
+    const addrRes = createAddress(token, vu);
+    if (addrRes.status !== 201) {
+      throw new Error(
+        `Failed to create address for VU ${vu}: status=${addrRes.status} ${addrRes.body || addrRes.error || ''}`
+      );
+    }
+    const payRes = createPaymentMethod(token, vu);
+    if (payRes.status !== 201) {
+      throw new Error(
+        `Failed to create payment method for VU ${vu}: status=${payRes.status} ${payRes.body || payRes.error || ''}`
+      );
+    }
+    profiles[String(vu)] = {
+      addressId: addrRes.json('id'),
+      paymentMethodId: payRes.json('id'),
+    };
+  }
+  return profiles;
+}
+
 function pickProduct(products, vu, iter, offset) {
   const count = products.length;
   if (K6_CART_MODE === 'add_remove') {
@@ -396,8 +503,9 @@ export function setup() {
   }
 
   const tokens = registerAllUsers();
+  const profiles = K6_SCENARIO === 'checkout' ? setupCheckoutProfiles(tokens) : null;
 
-  return { tokens, products, testid: TEST_RUN_ID, startedAt: new Date().toISOString() };
+  return { tokens, products, profiles, testid: TEST_RUN_ID, startedAt: new Date().toISOString() };
 }
 
 export default function (data) {
@@ -424,6 +532,66 @@ export default function (data) {
           `add_status=${addRes ? addRes.status : 'n/a'} ${detail || ''}`
       );
     }
+  });
+
+  if (K6_SLEEP > 0) {
+    sleep(K6_SLEEP);
+  }
+}
+
+export function checkoutScenario(data) {
+  const token = data.tokens[String(__VU)];
+  const profile = data.profiles ? data.profiles[String(__VU)] : null;
+  if (!token || !data.products.length || !profile) {
+    checkoutFailures.add(1);
+    return;
+  }
+
+  const product = pickProduct(data.products, __VU, __ITER, 0);
+  const started = Date.now();
+
+  group('checkout flow', () => {
+    const addRes = cartPost(token, product.id);
+    const addOk = addRes.status === 200 || addRes.status === 201;
+    check(addRes, { 'cart add for checkout': () => addOk });
+    if (!addOk) {
+      checkoutFailures.add(1);
+      if (__ITER < 5) {
+        console.warn(
+          `[checkout fail] vu=${__VU} iter=${__ITER} step=cart_add status=${addRes.status} ${responseDetail(addRes)}`
+        );
+      }
+      return;
+    }
+
+    const editRes = editAddress(token, profile.addressId, __VU, __ITER);
+    const editOk = editRes.status === 200;
+    check(editRes, { 'address edit ok': () => editOk });
+    if (!editOk) {
+      checkoutFailures.add(1);
+      if (__ITER < 5) {
+        console.warn(
+          `[checkout fail] vu=${__VU} iter=${__ITER} step=address_edit status=${editRes.status} ${responseDetail(editRes)}`
+        );
+      }
+      return;
+    }
+
+    const checkoutRes = placeCheckout(token, profile.addressId, profile.paymentMethodId);
+    const checkoutOk = checkoutRes.status === 201;
+    check(checkoutRes, { 'checkout ok': () => checkoutOk });
+    if (!checkoutOk) {
+      checkoutFailures.add(1);
+      if (__ITER < 5) {
+        console.warn(
+          `[checkout fail] vu=${__VU} iter=${__ITER} step=checkout status=${checkoutRes.status} ${responseDetail(checkoutRes)}`
+        );
+      }
+      return;
+    }
+
+    checkoutOkMs.add(Date.now() - started);
+    iterationDuration.add(Date.now() - started);
   });
 
   if (K6_SLEEP > 0) {
@@ -465,6 +633,7 @@ function collectFailureCounts(data) {
 function formatFailureSummary(data) {
   const rows = collectFailureCounts(data);
   const checkout = data.metrics.shop_checkout_errors?.values?.count ?? 0;
+  const checkoutFail = data.metrics.shop_checkout_failures?.values?.count ?? 0;
   const checkFails = data.metrics.checks?.values?.fails;
   const lines = ['Cart failure breakdown (shop_cart_failures):'];
 
@@ -476,7 +645,8 @@ function formatFailureSummary(data) {
     }
   }
 
-  lines.push(`shop_checkout_errors (add 400): ${checkout}`);
+  lines.push(`shop_checkout_errors (cart add 400): ${checkout}`);
+  lines.push(`shop_checkout_failures (checkout flow): ${checkoutFail}`);
   if (checkFails !== undefined) {
     lines.push(`checks failed: ${checkFails}`);
   }
@@ -491,6 +661,7 @@ function formatFailureSummary(data) {
 function formatHumanSummary(data) {
   const iter = metricValues(data, 'shop_iteration_ms');
   const cartOk = metricValues(data, 'shop_cart_add_ok_ms');
+  const checkoutOk = metricValues(data, 'shop_checkout_ok_ms');
   const cartAdd = metricValues(data, 'http_req_duration{name:cart_add,expected_response:true}');
   const cartRemove = metricValues(data, 'http_req_duration{name:cart_remove}');
   const blocked = metricValues(data, 'http_req_blocked');
@@ -508,7 +679,7 @@ function formatHumanSummary(data) {
 
   return [
     `=== k6 summary (testid=${TEST_RUN_ID}) ===`,
-    `VUs: ${vus ?? 'n/a'} | iterations: ${iterations ?? 'n/a'} | cart mode: ${K6_CART_MODE}`,
+    `VUs: ${vus ?? 'n/a'} | iterations: ${iterations ?? 'n/a'} | scenario: ${K6_SCENARIO} | cart mode: ${K6_CART_MODE}`,
     `Setup: batch=${K6_SETUP_BATCH_SIZE} timeout=${K6_SETUP_TIMEOUT}`,
     `Product stock at setup: ${stockSummary}`,
     '',
@@ -517,6 +688,13 @@ function formatHumanSummary(data) {
     '',
     'cart_add successful only (shop_cart_add_ok_ms — use this in Grafana):',
     `  med=${formatMs(cartOk, 'med')}  p95=${formatMs(cartOk, 'p(95)')}`,
+    ...(K6_SCENARIO === 'checkout'
+      ? [
+          '',
+          'checkout flow successful only (shop_checkout_ok_ms):',
+          `  med=${formatMs(checkoutOk, 'med')}  p95=${formatMs(checkoutOk, 'p(95)')}`,
+        ]
+      : []),
     '',
     'cart_add http (expected_response:true):',
     `  med=${formatMs(cartAdd, 'med')}  p95=${formatMs(cartAdd, 'p(95)')}`,

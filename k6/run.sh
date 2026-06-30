@@ -44,8 +44,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "Created $ENV_FILE — edit BASE_URL and PROMETHEUS_RW_URL before running."
 fi
 
+# Load .env without overwriting variables already set on the command line.
 # shellcheck disable=SC1090
-set -a
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
   [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -53,12 +53,13 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^[[:space:]]*([^=]+)=(.*)$ ]]; then
     name="${BASH_REMATCH[1]// /}"
     value="${BASH_REMATCH[2]}"
-    # Legacy key — prefix is always derived from TEST_RUN_ID
     [[ "$name" == "TEST_EMAIL_PREFIX" ]] && continue
+    if [[ -v "$name" ]]; then
+      continue
+    fi
     export "$name=$value"
   fi
 done <"$ENV_FILE"
-set +a
 
 if [[ -z "${BASE_URL:-}" ]]; then
   echo "ERROR: BASE_URL is required in $ENV_FILE" >&2
@@ -72,12 +73,19 @@ fi
 
 if [[ -z "${TEST_RUN_ID:-}" ]]; then
   TEST_RUN_ID="$(date +%s%3N)"
-  export TEST_RUN_ID TEST_ID="$TEST_RUN_ID"
 fi
+export TEST_RUN_ID
+export TEST_ID="${TEST_ID:-$TEST_RUN_ID}"
 
+K6_SCENARIO="${K6_SCENARIO:-browse_and_cart}"
+case "$K6_SCENARIO" in
+  checkout) TEST_SCENARIO_SUFFIX=checkout ;;
+  *) TEST_SCENARIO_SUFFIX=cart ;;
+esac
+
+SHOP_K6_VUS="${SHOP_K6_VUS:-${K6_VUS:-5}}"
 EMAIL_BASE="${TEST_EMAIL_PREFIX_BASE:-k6user}"
-unset TEST_EMAIL_PREFIX 2>/dev/null || true
-export TEST_EMAIL_PREFIX="${EMAIL_BASE}-${TEST_RUN_ID}"
+USER_PREFIX="${EMAIL_BASE}-${TEST_RUN_ID}-${TEST_SCENARIO_SUFFIX}"
 
 echo "Pulling k6 image ($IMAGE)..."
 docker pull "$IMAGE" >/dev/null
@@ -87,15 +95,17 @@ docker_args=(
   -v "${SCRIPT_DIR}:/scripts:ro"
   -e "BASE_URL=${BASE_URL}"
   -e "TEST_EMAIL_PREFIX_BASE=${EMAIL_BASE}"
+  -e "TEST_SCENARIO_SUFFIX=${TEST_SCENARIO_SUFFIX}"
   -e "TEST_PASSWORD=${TEST_PASSWORD:-k6pass123}"
   -e "TEST_EMAIL_DOMAIN=${TEST_EMAIL_DOMAIN:-example.com}"
   -e "TEST_RUN_ID=${TEST_RUN_ID}"
   -e "TEST_ID=${TEST_ID}"
+  -e "SHOP_K6_VUS=${SHOP_K6_VUS}"
 )
 
 optional_vars=(
-  K6_VUS K6_RAMP_UP K6_HOLD K6_RAMP_DOWN K6_SLEEP K6_HTTP_TIMEOUT
-  K6_CART_MODE K6_NO_CONNECTION_REUSE K6_CART_RETRIES K6_SETUP_BATCH_SIZE K6_SETUP_TIMEOUT
+  K6_RAMP_UP K6_HOLD K6_RAMP_DOWN K6_SLEEP K6_HTTP_TIMEOUT
+  K6_SCENARIO K6_CART_MODE K6_NO_CONNECTION_REUSE K6_CART_RETRIES K6_SETUP_BATCH_SIZE K6_SETUP_TIMEOUT
   K6_SUMMARY_TREND_STATS
   K6_THRESHOLD_HTTP_AVG_MS K6_THRESHOLD_HTTP_MIN_MS K6_THRESHOLD_HTTP_MAX_MS
   K6_THRESHOLD_HTTP_P95_MS K6_THRESHOLD_HTTP_P99_MS
@@ -139,8 +149,8 @@ k6_args+=("/scripts/shopperf.js")
 
 echo "Target: ${BASE_URL}"
 echo "Test ID (testid tag): ${TEST_RUN_ID}"
-echo "Users: ${TEST_EMAIL_PREFIX}-vu{N}@${TEST_EMAIL_DOMAIN:-example.com}"
-echo "Profile: ${K6_VUS:-5} VUs, ramp ${K6_RAMP_UP:-5s} / hold ${K6_HOLD:-25s} / down ${K6_RAMP_DOWN:-5s}, cart=${K6_CART_MODE:-add}"
+echo "Users: ${USER_PREFIX}-vu{N}@${TEST_EMAIL_DOMAIN:-example.com}"
+echo "Profile: ${SHOP_K6_VUS} VUs, ramp ${K6_RAMP_UP:-5s} / hold ${K6_HOLD:-25s} / down ${K6_RAMP_DOWN:-5s}, scenario=${K6_SCENARIO}, cart=${K6_CART_MODE:-add_remove}"
 echo "Running k6 via Docker..."
 
 docker_args+=("$IMAGE" "${k6_args[@]}")

@@ -109,10 +109,38 @@ cd /mnt/c/Users/flyluk/Projects/shopperf/k6
 
 ## What the test does
 
-1. **Setup:** health check, list products, register one user per VU (`k6user-{runId}-vu{N}@example.com`)
-2. **Each iteration:** add one item to cart, then delete it (`add_remove` mode — restores stock)
-3. **Metrics:** `shop_iteration_ms`, `shop_cart_add_ok_ms`, per-endpoint HTTP durations, failure counters
-4. **Thresholds:** configurable via `k6/.env` (default: p95 < 2s, checks pass rate > 95%)
+Two scenarios (set `K6_SCENARIO` in `k6/.env` or on the CLI):
+
+| Scenario | `K6_SCENARIO` | Flow |
+|----------|---------------|------|
+| Browse + cart (default) | `browse_and_cart` | Add item to cart, then delete (`add_remove` restores stock) |
+| Checkout | `checkout` | Add to cart → edit address → place order |
+
+**Setup:** health check, list products, register one user per VU (`k6user-{runId}-{cart\|checkout}-vu{N}@example.com`). Checkout also creates address + payment method per VU.
+
+**Metrics:** `shop_iteration_ms`, `shop_cart_add_ok_ms`, `shop_checkout_ok_ms` (checkout), per-endpoint HTTP durations, failure counters.
+
+**Thresholds:** configurable via `k6/.env` (default: p95 < 2s, checks pass rate > 95%).
+
+### Run checkout scenario
+
+```bash
+K6_SCENARIO=checkout ./run.sh --test-id checkout-1
+```
+
+### Run two scenarios in parallel
+
+Use **separate terminals**. CLI env vars override `k6/.env`. Use `SHOP_K6_VUS` (not `K6_VUS`) on the CLI so ramping stages are not overridden.
+
+```bash
+# Terminal 1 — browse + cart
+K6_SCENARIO=browse_and_cart SHOP_K6_VUS=15 TEST_RUN_ID=mix ./run.sh
+
+# Terminal 2 — checkout
+K6_SCENARIO=checkout SHOP_K6_VUS=5 TEST_RUN_ID=mix ./run.sh
+```
+
+Each scenario gets its own user suffix (`-cart` / `-checkout`) so carts are not shared even with the same `TEST_RUN_ID`.
 
 ---
 
@@ -120,12 +148,13 @@ cd /mnt/c/Users/flyluk/Projects/shopperf/k6
 
 | Variable | Recommended | Purpose |
 |----------|-------------|---------|
+| `K6_SCENARIO` | `browse_and_cart` | `checkout` = cart → edit address → place order |
 | `K6_CART_MODE` | `add_remove` | Add + delete each iter; stock stays flat |
 | `K6_NO_CONNECTION_REUSE` | `false` | Reuse TCP from Docker (faster) |
 | `K6_CART_RETRIES` | `1` | Retry add/delete on HTTP timeout |
 | `K6_HTTP_TIMEOUT` | `10s` | Don't raise to mask server queueing |
 | `K6_THRESHOLD_HTTP_FAILED` | `0.05` | Fail if >5% checks fail (`off` to disable) |
-| `K6_VUS` | start 5–20 | Raise only if p95 stays under threshold |
+| `K6_VUS` | start 5–20 | VU count in `.env`; on CLI use `SHOP_K6_VUS` instead |
 
 See `k6/.env.example` for the full list including per-endpoint latency thresholds.
 
@@ -164,6 +193,7 @@ Full diagnosis guide: **`scripts/APP-TUNING.md`**.
 | No Grafana metrics | Run `./scripts/expose-prometheus.sh`; verify `PROMETHEUS_RW_URL` |
 | Prometheus 404 on `/api/v1/write` | Confirm `enableRemoteWriteReceiver: true` on Prometheus CR |
 | `checks` threshold failed | Read failure breakdown; see APP-TUNING.md |
+| Parallel runs share carts / wrong VU count | CLI vars override `.env`; use `SHOP_K6_VUS` and distinct scenario suffixes (automatic) |
 | `GET /api/products` 500 in setup | Run `init-shop-demo-db.sh` on dev-vm1 (shop-demo) |
 | `bash\r: No such file` | Scripts need LF line endings — run `sed -i 's/\r$//' k6/run.sh` |
 
